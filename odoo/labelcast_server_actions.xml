@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!--
+    ╔══════════════════════════════════════════════════════════════════╗
+    ║           LabelCast Print Agent — Odoo Server Action            ║
+    ║                                                                  ║
+    ║  Drop this file into any Odoo module's data/ folder and add     ║
+    ║  it to __manifest__.py data list, OR import via:                ║
+    ║  Settings > Technical > Server Actions > Import                 ║
+    ║                                                                  ║
+    ║  CONFIGURE THESE THREE SYSTEM PARAMETERS FIRST:                 ║
+    ║    labelcast.agent.url   = http://192.168.1.50:7777              ║
+    ║    labelcast.api.token   = your-secret-token                    ║
+    ║    labelcast.report.name = stock.report_picking (example)       ║
+    ╚══════════════════════════════════════════════════════════════════╝
+    -->
+
+    <!-- ══════════════════════════════════════════════════
+         SYSTEM PARAMETERS
+         Set these in Settings > Technical > System Parameters
+         ════════════════════════════════════════════════ -->
+
+    <record id="labelcast_agent_url" model="ir.config_parameter">
+        <field name="key">labelcast.agent.url</field>
+        <field name="value">http://192.168.1.50:7777</field>
+    </record>
+
+    <record id="labelcast_api_token" model="ir.config_parameter">
+        <field name="key">labelcast.api.token</field>
+        <field name="value">change-me-to-your-secret-token</field>
+    </record>
+
+    <!--
+        labelcast.report.name controls which report gets printed.
+        Common values:
+          stock.report_picking           — Delivery / Transfer
+          stock.report_lot_label         — Lot / Serial number label
+          product.report_producttemplatelabel — Product label
+          stock.report_reception_report  — Reception report
+          stock.label_transfer           — Transfer label
+        Override per action if you create multiple actions below.
+    -->
+    <record id="labelcast_report_name" model="ir.config_parameter">
+        <field name="key">labelcast.report.name</field>
+        <field name="value">stock.report_picking</field>
+    </record>
+
+    <record id="labelcast_copies" model="ir.config_parameter">
+        <field name="key">labelcast.copies</field>
+        <field name="value">1</field>
+    </record>
+
+
+    <!-- ══════════════════════════════════════════════════
+         ACTION 1 — Print Transfer / Delivery Order
+         Attach to stock.picking (Inventory > Transfers)
+         ════════════════════════════════════════════════ -->
+
+    <record id="action_labelcast_print_transfer" model="ir.actions.server">
+        <field name="name">Print Label (LabelCast)</field>
+        <field name="model_id" ref="stock.model_stock_picking"/>
+        <field name="binding_model_id" ref="stock.model_stock_picking"/>
+        <field name="binding_view_types">list,form</field>
+        <field name="state">code</field>
+        <field name="code">
+# ── LabelCast Print Action ─────────────────────────────────────────────
+# Renders the configured report as PDF and sends it to the LabelCast
+# agent running on your local network.
+#
+# To customise: change the report_name variable below, or update the
+# labelcast.report.name system parameter.
+# ───────────────────────────────────────────────────────────────────────
+
+import base64
+import json
+import urllib.request
+import urllib.error
+
+# ── Read configuration from system parameters ──────────────────────────
+get_param = env['ir.config_parameter'].sudo().get_param
+
+agent_url  = get_param('labelcast.agent.url',   'http://localhost:7777')
+api_token  = get_param('labelcast.api.token',   '')
+report_xml = get_param('labelcast.report.name', 'stock.report_picking')
+copies     = int(get_param('labelcast.copies',  '1'))
+
+# ── Collect record IDs (works from list view multi-select too) ─────────
+if hasattr(records, '__iter__'):
+    record_ids = records.ids
+else:
+    record_ids = [record.id]
+
+if not record_ids:
+    raise UserError("No records selected to print.")
+
+errors = []
+
+for rec_id in record_ids:
+    try:
+        # ── Render report to PDF bytes ──────────────────────────────────
+        report     = env['ir.actions.report']
+        pdf_bytes, _ = report._render_qweb_pdf(report_xml, [rec_id])
+
+        # ── Build the record label name ─────────────────────────────────
+        rec = env[records._name].browse(rec_id)
+        label_name = getattr(rec, 'name', str(rec_id)) or str(rec_id)
+
+        # ── Encode PDF to base64 ────────────────────────────────────────
+        pdf_b64 = base64.b64encode(pdf_bytes).decode('utf-8')
+
+        # ── Build JSON payload ──────────────────────────────────────────
+        payload = json.dumps({
+            'pdf':    pdf_b64,
+            'copies': copies,
+            'label':  label_name,
+        }).encode('utf-8')
+
+        # ── Send HTTP POST to LabelCast agent ───────────────────────────
+        req = urllib.request.Request(
+            url     = agent_url.rstrip('/') + '/print',
+            data    = payload,
+            method  = 'POST',
+            headers = {
+                'Content-Type':   'application/json',
+                'X-Print-Token':  api_token,
+                'Accept':         'application/json',
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode('utf-8'))
+                job_id = result.get('jobId', 'unknown')
+                # Successful — log it
+                env['ir.logging'].sudo().create({
+                    'name':     'LabelCast',
+                    'type':     'client',
+                    'level':    'INFO',
+                    'message':  f'Print job queued: {label_name} → jobId={job_id}',
+                    'path':     'labelcast',
+                    'func':     'print_action',
+                    'line':     '0',
+                    'dbname':   env.cr.dbname,
+                })
+
+        except urllib.error.HTTPError as e:
+            body = e.read().decode('utf-8', errors='replace')
+            errors.append(f"{label_name}: HTTP {e.code} — {body}")
+
+        except urllib.error.URLError as e:
+            errors.append(
+                f"{label_name}: Could not reach LabelCast agent at {agent_url}. "
+                f"Is it running? ({e.reason})"
+            )
+
+    except Exception as e:
+        errors.append(f"Record {rec_id}: {str(e)}")
+
+# ── Surface any errors to the user ─────────────────────────────────────
+if errors:
+    raise UserError(
+        "LabelCast — some jobs failed:\n\n" + "\n".join(errors)
+    )
+        </field>
+    </record>
+
+
+    <!-- ══════════════════════════════════════════════════
+         ACTION 2 — Print Product Label
+         Attach to product.template (Inventory > Products)
+         ════════════════════════════════════════════════ -->
+
+    <record id="action_labelcast_print_product_label" model="ir.actions.server">
+        <field name="name">Print Product Label (LabelCast)</field>
+        <field name="model_id" ref="product.model_product_template"/>
+        <field name="binding_model_id" ref="product.model_product_template"/>
+        <field name="binding_view_types">list,form</field>
+        <field name="state">code</field>
+        <field name="code">
+import base64
+import json
+import urllib.request
+import urllib.error
+
+get_param  = env['ir.config_parameter'].sudo().get_param
+agent_url  = get_param('labelcast.agent.url',   'http://localhost:7777')
+api_token  = get_param('labelcast.api.token',   '')
+report_xml = 'product.report_producttemplatelabel'
+copies     = int(get_param('labelcast.copies',  '1'))
+
+if hasattr(records, '__iter__'):
+    record_ids = records.ids
+else:
+    record_ids = [record.id]
+
+if not record_ids:
+    raise UserError("No products selected.")
+
+errors = []
+
+for rec_id in record_ids:
+    try:
+        pdf_bytes, _ = env['ir.actions.report']._render_qweb_pdf(
+            report_xml, [rec_id]
+        )
+        rec        = env['product.template'].browse(rec_id)
+        label_name = rec.name or str(rec_id)
+        pdf_b64    = base64.b64encode(pdf_bytes).decode('utf-8')
+
+        payload = json.dumps({
+            'pdf':    pdf_b64,
+            'copies': copies,
+            'label':  label_name,
+        }).encode('utf-8')
+
+        req = urllib.request.Request(
+            url     = agent_url.rstrip('/') + '/print',
+            data    = payload,
+            method  = 'POST',
+            headers = {
+                'Content-Type':  'application/json',
+                'X-Print-Token': api_token,
+                'Accept':        'application/json',
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            errors.append(f"{label_name}: HTTP {e.code}")
+        except urllib.error.URLError as e:
+            errors.append(f"{label_name}: Cannot reach agent at {agent_url} ({e.reason})")
+
+    except Exception as e:
+        errors.append(f"Product {rec_id}: {str(e)}")
+
+if errors:
+    raise UserError("LabelCast errors:\n\n" + "\n".join(errors))
+        </field>
+    </record>
+
+
+    <!-- ══════════════════════════════════════════════════
+         ACTION 3 — Print Lot / Serial Number Label
+         Attach to stock.lot
+         ════════════════════════════════════════════════ -->
+
+    <record id="action_labelcast_print_lot_label" model="ir.actions.server">
+        <field name="name">Print Lot Label (LabelCast)</field>
+        <field name="model_id" ref="stock.model_stock_lot"/>
+        <field name="binding_model_id" ref="stock.model_stock_lot"/>
+        <field name="binding_view_types">list,form</field>
+        <field name="state">code</field>
+        <field name="code">
+import base64
+import json
+import urllib.request
+import urllib.error
+
+get_param  = env['ir.config_parameter'].sudo().get_param
+agent_url  = get_param('labelcast.agent.url',   'http://localhost:7777')
+api_token  = get_param('labelcast.api.token',   '')
+report_xml = 'stock.report_lot_label'
+copies     = int(get_param('labelcast.copies',  '1'))
+
+if hasattr(records, '__iter__'):
+    record_ids = records.ids
+else:
+    record_ids = [record.id]
+
+if not record_ids:
+    raise UserError("No lots selected.")
+
+errors = []
+
+for rec_id in record_ids:
+    try:
+        pdf_bytes, _ = env['ir.actions.report']._render_qweb_pdf(
+            report_xml, [rec_id]
+        )
+        rec        = env['stock.lot'].browse(rec_id)
+        label_name = rec.name or str(rec_id)
+        pdf_b64    = base64.b64encode(pdf_bytes).decode('utf-8')
+
+        payload = json.dumps({
+            'pdf':    pdf_b64,
+            'copies': copies,
+            'label':  label_name,
+        }).encode('utf-8')
+
+        req = urllib.request.Request(
+            url     = agent_url.rstrip('/') + '/print',
+            data    = payload,
+            method  = 'POST',
+            headers = {
+                'Content-Type':  'application/json',
+                'X-Print-Token': api_token,
+                'Accept':        'application/json',
+            },
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                result = json.loads(resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            errors.append(f"{label_name}: HTTP {e.code}")
+        except urllib.error.URLError as e:
+            errors.append(f"{label_name}: Cannot reach agent ({e.reason})")
+
+    except Exception as e:
+        errors.append(f"Lot {rec_id}: {str(e)}")
+
+if errors:
+    raise UserError("LabelCast errors:\n\n" + "\n".join(errors))
+        </field>
+    </record>
+
+</odoo>
