@@ -51,7 +51,7 @@ Odoo Mobile → HTTP POST (PDF) → LabelCast Agent → PDF→ZPL → Zebra Prin
 
 ```bash
 # 1. Clone the repo
-git clone https://github.com/yourusername/labelcast-agent.git
+git clone https://github.com/labelcast/labelcast-agent.git
 cd labelcast-agent
 
 # 2. Copy the config file
