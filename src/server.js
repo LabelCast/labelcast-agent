@@ -2,22 +2,23 @@
 
 require('dotenv').config();
 
-const express = require('express');
-const multer = require('multer');
-const { enqueue, getJob, listJobs } = require('./queue');
+const express  = require('express');
+const multer   = require('multer');
+const config   = require('./config');
+const { enqueue, getJobStatus, getRecentJobs } = require('./queue');
 const { pingPrinter } = require('./printer');
-const logger = require('./logger');
+const logger   = require('./logger');
 
-const app = express();
+const app    = express();
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 50 * 1024 * 1024 }, // 50 MB max
+  limits:  { fileSize: 50 * 1024 * 1024 },
 });
 
-// â”€â”€ Auth middleware â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Auth middleware ────────────────────────────────────────────────────────
 function authMiddleware(req, res, next) {
-  const token = process.env.API_TOKEN;
-  if (!token || token === '') return next(); // auth disabled
+  const token = config.server.apiToken;
+  if (!token) return next();
 
   const provided =
     req.headers['x-print-token'] ||
@@ -30,151 +31,125 @@ function authMiddleware(req, res, next) {
   next();
 }
 
-app.use(express.json());
+app.use(express.json({ limit: '55mb' }));
 
-// â”€â”€ Health check (no auth) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+// ── Health check — no auth required ───────────────────────────────────────
 app.get('/health', async (_req, res) => {
-  const printer = await pingPrinter();
+  const ping = await pingPrinter();
   res.json({
-    status: 'ok',
-    agent: 'zebra-print-agent',
-    version: require('../package.json').version,
-    printer,
+    status:    'ok',
+    agent:     'labelcast-agent',
+    version:   require('../package.json').version,
+    printer: {
+      ok:        ping.reachable,
+      message:   ping.reachable ? `Reachable (${ping.latencyMs}ms)` : ping.error,
+      latencyMs: ping.latencyMs,
+    },
     timestamp: new Date().toISOString(),
   });
 });
 
-// â”€â”€ All other routes require auth â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.use(authMiddleware);
 
 /**
  * POST /print
- *
- * Accepts a PDF in one of three ways:
- *   1. Multipart field named "pdf" (file upload)
- *   2. Raw binary body with Content-Type: application/pdf
- *   3. JSON body: { "pdf": "<base64>", "copies": 1, "label": "shipping" }
- *
+ * Accepts PDF via multipart, raw body, or JSON base64.
  * Returns: { jobId, status, message }
  */
-app.post(
-  '/print',
-  upload.single('pdf'),
-  async (req, res) => {
-    let pdfBuffer;
-    let copies = 1;
-    let labelName = 'label';
+app.post('/print', upload.single('pdf'), async (req, res) => {
+  let pdfBuffer;
+  let copies    = 1;
+  let labelName = 'label';
 
-    try {
-      // â”€â”€ Source 1: multipart file upload â”€â”€
-      if (req.file) {
-        pdfBuffer = req.file.buffer;
-        copies = req.body.copies || 1;
-        labelName = req.body.label || req.file.originalname || 'label';
-      }
-      // â”€â”€ Source 2: raw PDF body â”€â”€
-      else if (
-        req.headers['content-type']?.includes('application/pdf')
-      ) {
-        // Read raw body (express.json() won't have parsed this)
-        pdfBuffer = await readRawBody(req);
-        copies = req.query.copies || 1;
-        labelName = req.query.label || 'label';
-      }
-      // â”€â”€ Source 3: JSON with base64 â”€â”€
-      else if (req.body?.pdf) {
-        pdfBuffer = Buffer.from(req.body.pdf, 'base64');
-        copies = req.body.copies || 1;
-        labelName = req.body.label || 'label';
-      } else {
-        return res.status(400).json({
-          error: 'No PDF provided. Send as multipart "pdf" field, raw application/pdf body, or JSON { pdf: "<base64>" }',
-        });
-      }
-
-      if (!pdfBuffer || pdfBuffer.length === 0) {
-        return res.status(400).json({ error: 'PDF buffer is empty' });
-      }
-
-      // Basic PDF magic bytes check
-      if (pdfBuffer.slice(0, 4).toString() !== '%PDF') {
-        return res.status(400).json({ error: 'File does not appear to be a valid PDF' });
-      }
-
-      const job = enqueue(pdfBuffer, { copies, labelName });
-
-      logger.info('Print job accepted', {
-        jobId: job.id,
-        labelName: job.labelName,
-        copies: job.copies,
-        sizeKb: Math.round(pdfBuffer.length / 1024),
-        ip: req.ip,
+  try {
+    if (req.file) {
+      pdfBuffer = req.file.buffer;
+      copies    = parseInt(req.body.copies || '1', 10);
+      labelName = req.body.label || req.file.originalname || 'label';
+    } else if (req.headers['content-type']?.includes('application/pdf')) {
+      pdfBuffer = await readRawBody(req);
+      copies    = parseInt(req.query.copies || '1', 10);
+      labelName = req.query.label || 'label';
+    } else if (req.body?.pdf) {
+      pdfBuffer = Buffer.from(req.body.pdf, 'base64');
+      copies    = parseInt(req.body.copies || '1', 10);
+      labelName = req.body.label || 'label';
+    } else {
+      return res.status(400).json({
+        error: 'No PDF provided. Send as multipart "pdf" field, raw application/pdf body, or JSON { pdf: "<base64>" }',
       });
-
-      return res.status(202).json({
-        jobId: job.id,
-        status: job.status,
-        message: 'Job queued successfully',
-      });
-    } catch (err) {
-      logger.error('Error accepting print job', { error: err.message });
-      return res.status(500).json({ error: err.message });
     }
-  }
-);
 
-/**
- * GET /jobs
- * Returns the last 50 print jobs with their status.
- */
-app.get('/jobs', (_req, res) => {
-  res.json(listJobs());
+    if (!pdfBuffer || pdfBuffer.length === 0) {
+      return res.status(400).json({ error: 'PDF buffer is empty' });
+    }
+
+    if (pdfBuffer.slice(0, 4).toString() !== '%PDF') {
+      return res.status(400).json({ error: 'File does not appear to be a valid PDF' });
+    }
+
+    const jobId = enqueue(pdfBuffer, { copies, label: labelName });
+
+    logger.info('Print job accepted', {
+      jobId,
+      labelName,
+      copies,
+      sizeKb: Math.round(pdfBuffer.length / 1024),
+      ip: req.ip,
+    });
+
+    return res.status(202).json({
+      jobId,
+      status:  'queued',
+      message: 'Job queued successfully',
+    });
+
+  } catch (err) {
+    logger.error('Error accepting print job', { error: err.message });
+    return res.status(500).json({ error: err.message });
+  }
 });
 
-/**
- * GET /jobs/:id
- * Returns a single job's status.
- */
+app.get('/jobs', (_req, res) => {
+  res.json(getRecentJobs());
+});
+
 app.get('/jobs/:id', (req, res) => {
-  const job = getJob(req.params.id);
+  const job = getJobStatus(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   res.json(job);
 });
 
-/**
- * GET /printer/status
- * Pings the Zebra printer and returns connectivity status.
- */
 app.get('/printer/status', async (_req, res) => {
-  const result = await pingPrinter();
-  res.status(result.ok ? 200 : 503).json(result);
+  const ping = await pingPrinter();
+  res.status(ping.reachable ? 200 : 503).json({
+    ok:        ping.reachable,
+    message:   ping.reachable ? `Printer reachable (${ping.latencyMs}ms)` : ping.error,
+    latencyMs: ping.latencyMs,
+  });
 });
 
-// â”€â”€ 404 fallback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 app.use((req, res) => {
   res.status(404).json({ error: 'Not found', path: req.path });
 });
 
-// â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 function readRawBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', (c) => chunks.push(c));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('data',  (c) => chunks.push(c));
+    req.on('end',   ()  => resolve(Buffer.concat(chunks)));
     req.on('error', reject);
   });
 }
 
-// â”€â”€ Start â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-const PORT = parseInt(process.env.AGENT_PORT || '7777', 10);
-const HOST = process.env.AGENT_HOST || '0.0.0.0';
+const { port, host, apiToken } = config.server;
 
-app.listen(PORT, HOST, () => {
-  logger.info(`âœ“ Zebra Print Agent started`, {
-    url: `http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${PORT}`,
-    printer: `${process.env.PRINTER_HOST}:${process.env.PRINTER_PORT || 9100}`,
-    auth: process.env.API_TOKEN ? 'enabled' : 'DISABLED (set API_TOKEN in .env)',
+app.listen(port, host, () => {
+  logger.info('LabelCast agent started', {
+    url:     `http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`,
+    printer: `${config.printer.host}:${config.printer.port}`,
+    auth:    apiToken ? 'enabled' : 'DISABLED — set API_TOKEN in .env',
   });
 });
 
-module.exports = app; // for testing
+module.exports = app;
