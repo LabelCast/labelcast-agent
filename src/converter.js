@@ -1,86 +1,93 @@
 'use strict';
+
 /**
  * converter.js
+ *
  * Converts a PDF buffer to ZPL using:
- *   1. Ghostscript to rasterize PDF â†’ PNG (high quality)
- *   2. Sharp to threshold/dither the PNG to 1-bit
- *   3. Encode as ZPL ~GFA (compressed graphic field)
+ *   1. Ghostscript — rasterizes PDF pages to greyscale PNG
+ *   2. Sharp       — resizes (preserving aspect ratio) and thresholds to 1-bit
+ *   3. Bit packing — encodes as ZPL ^GFA with run-length compression
+ *
+ * Requires:
+ *   - Ghostscript installed and on PATH (or GS_PATH set in .env)
+ *   - sharp npm package: npm install sharp
  */
 
 const { execFile } = require('child_process');
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const sharp = require('sharp');
-const config = require('./config');
-const logger = require('./logger');
+const fs           = require('fs');
+const os           = require('os');
+const path         = require('path');
+const sharp        = require('sharp');
+const config       = require('./config');
+const logger       = require('./logger');
 
 const MM_TO_INCH = 1 / 25.4;
 
 /**
- * Convert PDF pages to ZPL strings
+ * Convert a PDF buffer to a ZPL string.
  * @param {Buffer} pdfBuffer
- * @param {object} opts  { copies: 1 }
- * @returns {Promise<string>}  Full ZPL document (all pages/labels)
+ * @param {{ copies?: number }} opts
+ * @returns {Promise<string>}
  */
 async function pdfToZpl(pdfBuffer, opts = {}) {
-  const copies = opts.copies || 1;
-  const dpi = config.printer.dpi;
-  const widthDots = Math.round(config.printer.labelWidthMm * MM_TO_INCH * dpi);
+  const copies      = opts.copies || 1;
+  const dpi         = config.printer.dpi;
+  const widthDots   = Math.round(config.printer.labelWidthMm * MM_TO_INCH * dpi);
 
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'zebra-'));
+  const tmpDir  = fs.mkdtempSync(path.join(os.tmpdir(), 'labelcast-'));
   const pdfPath = path.join(tmpDir, 'input.pdf');
   fs.writeFileSync(pdfPath, pdfBuffer);
 
   try {
-    // Step 1: Rasterize with Ghostscript
     const pngPattern = path.join(tmpDir, 'page-%03d.png');
     await ghostscriptRasterize(pdfPath, pngPattern, dpi);
 
-    // Step 2: Find rendered pages
     const pages = fs.readdirSync(tmpDir)
       .filter(f => f.startsWith('page-') && f.endsWith('.png'))
       .sort();
 
     if (pages.length === 0) throw new Error('Ghostscript produced no output pages');
-    logger.info(`Converted PDF to ${pages.length} PNG page(s)`, { dpi, widthDots });
+    logger.info(`PDF rasterized to ${pages.length} page(s)`, { dpi, widthDots });
 
-    // Step 3: Convert each page PNG to ZPL
     const zplParts = [];
     for (const page of pages) {
       const imgPath = path.join(tmpDir, page);
-      const zpl = await pngToZpl(imgPath, widthDots, dpi);
+      const zpl     = await pngToZpl(imgPath, widthDots, dpi);
       for (let i = 0; i < copies; i++) zplParts.push(zpl);
     }
 
     return zplParts.join('\n');
+
   } finally {
-    // Cleanup temp files
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (_) {}
   }
 }
 
 /**
- * Run Ghostscript to convert PDF â†’ PNG files
+ * Rasterize a PDF to greyscale PNG files using Ghostscript.
  */
 function ghostscriptRasterize(pdfPath, outputPattern, dpi) {
   return new Promise((resolve, reject) => {
-    const args = [
+    const gsPath = config.conversion.gsPath || 'gswin64c';
+    const args   = [
       '-dNOPAUSE', '-dBATCH', '-dSAFER',
       '-sDEVICE=pnggray',
       `-r${dpi}`,
       '-dGraphicsAlphaBits=4',
       '-dTextAlphaBits=4',
       `-sOutputFile=${outputPattern}`,
-      pdfPath
+      pdfPath,
     ];
 
-    logger.debug('Running Ghostscript', { gsPath: config.conversion.gsPath, args: args.join(' ') });
+    logger.debug('Running Ghostscript', { gsPath, dpi });
 
-    execFile(config.conversion.gsPath, args, { timeout: 60000 }, (err, stdout, stderr) => {
+    execFile(gsPath, args, { timeout: 60000 }, (err, _stdout, stderr) => {
       if (err) {
-        logger.error('Ghostscript failed', { err: err.message, stderr });
-        return reject(new Error(`Ghostscript error: ${err.message}\n${stderr}`));
+        const msg = err.code === 'ENOENT'
+          ? `Ghostscript not found at "${gsPath}". Install from https://ghostscript.com/releases/gsdnld.html and tick "Add to PATH", or set GS_PATH in .env`
+          : `Ghostscript error: ${err.message}\n${stderr}`;
+        logger.error('Ghostscript failed', { error: msg });
+        return reject(new Error(msg));
       }
       resolve();
     });
@@ -88,69 +95,72 @@ function ghostscriptRasterize(pdfPath, outputPattern, dpi) {
 }
 
 /**
- * Convert a grayscale PNG to ZPL ~GFA (compressed graphic)
+ * Convert a greyscale PNG to a ZPL ^GFA label string.
+ * Preserves aspect ratio — does not distort barcodes.
  */
 async function pngToZpl(imgPath, targetWidthDots, dpi) {
-  // Resize to exact label width, let height auto-scale
   const meta = await sharp(imgPath).metadata();
+
+  // Preserve aspect ratio — only constrain width, let height scale naturally
   const heightDots = config.printer.labelHeightMm > 0
     ? Math.round(config.printer.labelHeightMm * MM_TO_INCH * dpi)
     : Math.round((meta.height / meta.width) * targetWidthDots);
 
-  // Convert to 1-bit via threshold (Floyd-Steinberg dither via threshold)
+  // Resize preserving aspect ratio, then threshold to pure 1-bit
   const rawData = await sharp(imgPath)
-    .resize(targetWidthDots, heightDots, { fit: 'fill', kernel: 'lanczos3' })
+    .resize(targetWidthDots, heightDots, {
+      fit:    'contain',      // preserve aspect ratio — no distortion
+      kernel: 'lanczos3',
+      background: { r: 255, g: 255, b: 255 },
+    })
     .grayscale()
-    .threshold(128)  // binary threshold; adjust for label content
+    .threshold(128)
     .raw()
     .toBuffer();
 
-  // Pack bits: each pixel is 0 or 255; pack 8 pixels per byte (1=black for ZPL)
+  // Pack 8 pixels per byte (MSB first), 1 = black in ZPL
   const bytesPerRow = Math.ceil(targetWidthDots / 8);
-  const totalBytes = bytesPerRow * heightDots;
-  const packed = Buffer.alloc(totalBytes, 0);
+  const totalBytes  = bytesPerRow * heightDots;
+  const packed      = Buffer.alloc(totalBytes, 0);
 
   for (let y = 0; y < heightDots; y++) {
     for (let x = 0; x < targetWidthDots; x++) {
       const pixel = rawData[y * targetWidthDots + x];
-      if (pixel === 0) { // black pixel
-        const byteIndex = y * bytesPerRow + Math.floor(x / 8);
-        const bitIndex = 7 - (x % 8);
-        packed[byteIndex] |= (1 << bitIndex);
+      if (pixel === 0) {
+        const byteIdx = y * bytesPerRow + Math.floor(x / 8);
+        const bitIdx  = 7 - (x % 8);
+        packed[byteIdx] |= (1 << bitIdx);
       }
     }
   }
 
-  // Compress using ZPL Z64 (base64 + CRC) for efficiency
   const hexData = compressZplData(packed, bytesPerRow, heightDots);
 
-  const zpl = [
+  return [
     '^XA',
-    `^FO0,0`,
+    '^FO0,0',
     `^GFA,${totalBytes},${totalBytes},${bytesPerRow},${hexData}`,
-    '^XZ'
+    '^XZ',
   ].join('\n');
-
-  return zpl;
 }
 
 /**
- * ZPL hex encoding with repeat-character compression
- * Uses ZPL's built-in run-length encoding: repeats encoded as count+char
+ * ZPL run-length compression for ^GFA hex data.
+ * Repeated hex characters are encoded as count + char.
  */
 function compressZplData(buffer, bytesPerRow, rows) {
-  const hexChars = '0123456789ABCDEF';
-  // Map count to ZPL repeat chars (1=G, 2=H ... 19=Z, 20=g, etc.)
+  const HEX = '0123456789ABCDEF';
+
   const repeatChar = (n) => {
-    if (n === 0) return '';
-    const highCodes = 'GHIJKLMNOPQRSTUVWXY';
-    const lowCodes  = 'ghijklmnopqrstuvwxy';
-    let out = '';
-    const high = Math.floor(n / 20);
-    const low  = n % 20;
-    if (high > 0) out += highCodes[high - 1] || '';
-    if (low > 0)  out += lowCodes[low - 1];
-    return out;
+    if (n <= 0) return '';
+    const high = 'GHIJKLMNOPQRSTUVWXY';
+    const low  = 'ghijklmnopqrstuvwxy';
+    let out    = '';
+    const h    = Math.floor(n / 20);
+    const l    = n % 20;
+    if (h > 0 && h - 1 < high.length) out += high[h - 1];
+    if (l > 0 && l - 1 < low.length)  out += low[l - 1];
+    return out || '';
   };
 
   let result = '';
@@ -158,25 +168,19 @@ function compressZplData(buffer, bytesPerRow, rows) {
     let rowHex = '';
     for (let x = 0; x < bytesPerRow; x++) {
       const b = buffer[y * bytesPerRow + x];
-      rowHex += hexChars[b >> 4] + hexChars[b & 0xf];
+      rowHex += HEX[b >> 4] + HEX[b & 0xf];
     }
 
-    // Run-length compress the hex row
     let compressed = '';
     let i = 0;
     while (i < rowHex.length) {
-      const ch = rowHex[i];
-      let count = 1;
+      const ch    = rowHex[i];
+      let   count = 1;
       while (i + count < rowHex.length && rowHex[i + count] === ch && count < 399) count++;
-      if (count > 2) {
-        compressed += repeatChar(count) + ch;
-      } else {
-        compressed += ch.repeat(count);
-      }
+      compressed += count > 2 ? repeatChar(count) + ch : ch.repeat(count);
       i += count;
     }
 
-    // If entire row is same as previous, use ':'
     result += compressed + ':';
   }
   return result;
